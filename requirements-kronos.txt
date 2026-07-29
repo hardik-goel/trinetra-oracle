@@ -1,0 +1,5 @@
+# Extra deps for real Kronos inference (CPU works; ~2GB image)
+torch>=2.1
+einops
+huggingface_hub
+safetensors
