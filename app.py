@@ -9,6 +9,10 @@ OHLCV and reports the expected close-to-close return.
 The Node backend consumes this as one number per symbol (fcstReturn),
 which powers the "AI Forecast" criterion in the dashboard.
 
+Daily candles come from Yahoo Finance (same feed as the backend's yahooDelayed
+provider), with Stooq kept only as a fallback — Stooq now serves a bot-check
+page instead of CSV. See the constants block under "Data".
+
 Modes (env MODE):
   kronos  — real Kronos-mini inference (needs torch; CPU is fine)
   naive   — statistical fallback (drift + momentum), no torch needed
@@ -21,11 +25,13 @@ Endpoints:
 import os
 import io
 import csv
+import json
 import math
 import time
 import asyncio
+import urllib.error
 import urllib.request
-from datetime import date
+from datetime import date, datetime, timezone
 
 from fastapi import FastAPI, Query
 
@@ -59,16 +65,78 @@ def get_predictor():
         print(f"[oracle] Kronos unavailable → naive fallback ({e})")
     return _predictor
 
-# ---------------- Data: free EOD candles (Stooq) ---------------------
-def fetch_candles(symbol: str):
-    """Daily OHLCV for an NSE symbol from Stooq (free, no key)."""
-    url = f"https://stooq.com/q/d/l/?s={symbol.lower()}.in&i=d"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (trinetra-oracle)"})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        text = r.read().decode()
-    rows = list(csv.DictReader(io.StringIO(text)))
+# ---------------- Data: free EOD candles ------------------------------
+# One block for every endpoint/selector we depend on, so a blocked or moved
+# source is a one-line patch rather than a hunt through the file.
+#
+# Stooq (the original source) now answers with a JavaScript proof-of-work
+# bot-check page instead of CSV, so it parses to ~0 rows. Yahoo's chart API is
+# the same feed the backend's working `yahooDelayed` provider uses, so it leads;
+# Stooq stays wired up as a fallback in case the two swap places again.
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=1y"
+YAHOO_SUFFIX = ".NS"        # Yahoo's NSE convention: RELIANCE -> RELIANCE.NS
+STOOQ_CSV_URL = "https://stooq.com/q/d/l/?s={sym}.in&i=d"
+HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "10"))
+SYMBOL_DELAY = float(os.environ.get("SYMBOL_DELAY", "0.3"))  # be a good citizen
+# A real browser UA: Yahoo serves an error page to obviously-scripted clients.
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
+
+
+def _http_get(url: str) -> str:
+    req = urllib.request.Request(url, headers={
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json,text/csv,*/*",
+    })
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def yahoo_symbol(symbol: str) -> str:
+    """RELIANCE -> RELIANCE.NS; pass through anything already suffixed."""
+    s = symbol.strip().upper()
+    return s if "." in s else s + YAHOO_SUFFIX
+
+
+def fetch_yahoo(symbol: str):
+    """Daily OHLCV from Yahoo's chart API."""
+    payload = json.loads(_http_get(YAHOO_CHART_URL.format(sym=yahoo_symbol(symbol))))
+    result = ((payload.get("chart") or {}).get("result") or [None])[0]
+    if not result:
+        err = (payload.get("chart") or {}).get("error")
+        raise ValueError(f"empty chart result ({err})")
+    stamps = result.get("timestamp") or []
+    quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+    o, h, l = quote.get("open") or [], quote.get("high") or [], quote.get("low") or []
+    c, v = quote.get("close") or [], quote.get("volume") or []
+
     out = []
-    for row in rows:
+    for i, ts in enumerate(stamps):
+        try:
+            # Yahoo leaves nulls in the series for halted/missing sessions.
+            row = (o[i], h[i], l[i], c[i])
+            if ts is None or any(x is None for x in row):
+                continue
+            out.append({
+                "ts": datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d"),
+                "open": float(o[i]), "high": float(h[i]),
+                "low": float(l[i]), "close": float(c[i]),
+                "volume": float(v[i] or 0) if i < len(v) else 0.0,
+            })
+        except (IndexError, TypeError, ValueError):
+            continue
+    return out[-LOOKBACK:]
+
+
+def fetch_stooq(symbol: str):
+    """Daily OHLCV from Stooq CSV. Deprecated — kept as a fallback only."""
+    text = _http_get(STOOQ_CSV_URL.format(sym=symbol.lower()))
+    if not text.lstrip().lower().startswith("date"):
+        raise ValueError("not CSV (bot-check page?)")
+    out = []
+    for row in csv.DictReader(io.StringIO(text)):
         try:
             out.append({
                 "ts": row["Date"],
@@ -79,6 +147,34 @@ def fetch_candles(symbol: str):
         except (KeyError, ValueError):
             continue
     return out[-LOOKBACK:]
+
+
+SOURCES = [("yahoo", fetch_yahoo), ("stooq", fetch_stooq)]
+
+
+def fetch_candles(symbol: str):
+    """Daily OHLCV for an NSE symbol. Returns (candles, source_name).
+
+    Tries each source in order and takes the first that yields usable rows, so
+    one blocked provider degrades to the other instead of to silence.
+    """
+    for name, fn in SOURCES:
+        try:
+            candles = fn(symbol)
+        except urllib.error.HTTPError as e:
+            print(f"[oracle] {symbol}: {name} HTTP {e.code}")
+            continue
+        except Exception as e:
+            print(f"[oracle] {symbol}: {name} failed ({e})")
+            continue
+        finally:
+            time.sleep(SYMBOL_DELAY)  # pace network hits regardless of outcome
+        if candles:
+            print(f"[oracle] {symbol}: {len(candles)} candles from {name}")
+            return candles, name
+        print(f"[oracle] {symbol}: {name} returned 0 candles")
+    print(f"[oracle] {symbol}: no data source available")
+    return [], None
 
 # ---------------- Forecasters ----------------------------------------
 def forecast_kronos(candles, horizon):
@@ -121,18 +217,27 @@ def forecast_naive(candles, horizon):
     return {"ret": round(total * 100, 2), "path": path, "engine": "naive"}
 
 def forecast(symbol, horizon):
-    candles = fetch_candles(symbol)
+    candles, source = fetch_candles(symbol)
     if len(candles) < 60:
+        print(f"[oracle] {symbol}: only {len(candles)} candles (need 60) — skipping")
         return None
+    out = None
     if get_predictor() is not None:
         try:
-            return forecast_kronos(candles, horizon)
+            out = forecast_kronos(candles, horizon)
         except Exception as e:
             print(f"[oracle] kronos failed for {symbol}: {e}")
-    return forecast_naive(candles, horizon)
+    if out is None:
+        out = forecast_naive(candles, horizon)
+    if out is not None:
+        out["source"] = source
+    return out
 
 # ---------------- Cache: one forecast per symbol per day -------------
-_cache = {}  # symbol -> {"day": iso, "horizon": n, "data": {...}}
+# Successes only. Caching a None would pin a transient data outage for the rest
+# of the day and report it as a "cached forecast", which it is not.
+_cache = {}     # symbol -> {"day": iso, "horizon": n, "data": {...}}
+_failed = {}    # symbol -> iso day of the last failed attempt (never gates retries)
 
 def cached_forecast(symbol, horizon):
     today = date.today().isoformat()
@@ -140,18 +245,27 @@ def cached_forecast(symbol, horizon):
     if hit and hit["day"] == today and hit["horizon"] == horizon:
         return hit["data"]
     data = forecast(symbol, horizon)
-    _cache[symbol] = {"day": today, "horizon": horizon, "data": data}
+    if data:
+        _cache[symbol] = {"day": today, "horizon": horizon, "data": data}
+        _failed.pop(symbol, None)
+    else:
+        _failed[symbol] = today  # observability only — next request retries
     return data
 
 # ---------------- API -------------------------------------------------
 @app.get("/health")
 def health():
     p = get_predictor()
+    today = date.today().isoformat()
+    ok = sum(1 for v in _cache.values() if v["day"] == today and v["data"])
     return {
         "ok": True,
         "engine": "kronos-mini" if p is not None else "naive",
         "note": None if p is not None else f"Kronos not loaded: {_kronos_err}",
-        "cached": len(_cache),
+        "cached": ok,        # successful forecasts held for today
+        "cached_ok": ok,
+        "cached_failed": sum(1 for d in _failed.values() if d == today),
+        "sources": [name for name, _ in SOURCES],
     }
 
 @app.get("/forecasts")
